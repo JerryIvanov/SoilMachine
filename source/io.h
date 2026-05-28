@@ -217,6 +217,8 @@ void loadsoil( string file = "soil/default.soil" ){
         NWIND = stoi(val);
       if(tag == "NWATER")
         NWATER = stoi(val);
+      if(tag == "MESA_POWER")
+        MESA_POWER = stof(val);
     }
 
   }
