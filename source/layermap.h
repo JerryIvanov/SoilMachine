@@ -23,6 +23,10 @@ Air e.g. has porosity 1
 #include "include/FastNoiseLite.h"
 
 #include <glm/glm.hpp>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <cstdint>
 using namespace glm;
 using namespace std;
 
@@ -61,59 +65,80 @@ void reset(){
 
 };
 
+// Thread-local кэш sec-элементов: каждый поток держит мелкий локальный запас.
+// get/unget обращаются к глобальному пулу только при пустом/переполненном кэше (batch).
+// Это сводит contention на pool_mutex к минимуму: 1 lock на batch вместо 1 lock на элемент.
+// inline thread_local — C++17, одна переменная на поток через все TU.
+inline thread_local std::vector<sec*> tl_sec_cache;
+static constexpr int TL_SEC_CACHE_MAX  = 64; // flush-порог
+static constexpr int TL_SEC_BATCH_SIZE = 32; // размер batch get/flush
+
 class secpool {
 public:
 
-int size;               //Number of Total Elements
-sec* start = NULL;      //Point to Start of Pool
-deque<sec*> free;       //Queue of Free Elements
+int size = 0;
+sec* start = NULL;
+std::vector<sec*> free_global;     // глобальный пул
+mutable std::mutex pool_mutex;     // защищает free_global
 
-secpool(){}             //Construct
-secpool(const int N){   //Construct with Size
-  reserve(N);
-}
-~secpool(){
-  free.clear();
-  delete[] start;
-}
+secpool(){}
+secpool(const int N){ reserve(N); }
+~secpool(){ delete[] start; }
 
-//Create the Memory Pool
 void reserve(const int N){
   start = new sec[N];
-  for(int i = 0; i < N; i++)
-    free.push_front(start+i);
-  size = N;
+  size  = N;
+  free_global.reserve(N);
+  for(int i = 0; i < N; i++) free_global.push_back(&start[i]);
 }
 
-//Retrieve Element, Construct in Place
 template<typename... Args>
 sec* get(Args && ...args){
-
-  if(free.empty()){
-    cout<<"Memory Pool Out-Of-Elements"<<endl;
-    return NULL;
+  // Быстрый путь: берём из thread-local кэша (без лока)
+  if(!tl_sec_cache.empty()){
+    sec* E = tl_sec_cache.back();
+    tl_sec_cache.pop_back();
+    try{ new (E)sec(forward<Args>(args)...); }
+    catch(...){ throw; }
+    return E;
   }
-
-  sec* E = free.back();
+  // Медленный путь: batch-пополнение из глобального пула
+  {
+    std::lock_guard<std::mutex> lk(pool_mutex);
+    int n = (int)std::min((size_t)TL_SEC_BATCH_SIZE, free_global.size());
+    if(n == 0){ cout<<"Memory Pool Out-Of-Elements"<<endl; return NULL; }
+    for(int i = 0; i < n; i++){
+      tl_sec_cache.push_back(free_global.back());
+      free_global.pop_back();
+    }
+  }
+  sec* E = tl_sec_cache.back();
+  tl_sec_cache.pop_back();
   try{ new (E)sec(forward<Args>(args)...); }
-  catch(...) { throw; }
-  free.pop_back();
+  catch(...){ throw; }
   return E;
-
 }
 
-//Return Element
 void unget(sec* E){
-  if(E == NULL)
-    return;
+  if(!E) return;
   E->reset();
-  free.push_front(E);
+  tl_sec_cache.push_back(E);
+  // Flush в глобальный пул когда кэш переполнен
+  if((int)tl_sec_cache.size() > TL_SEC_CACHE_MAX){
+    std::lock_guard<std::mutex> lk(pool_mutex);
+    for(int i = 0; i < TL_SEC_BATCH_SIZE; i++){
+      free_global.push_back(tl_sec_cache.back());
+      tl_sec_cache.pop_back();
+    }
+  }
 }
 
 void reset(){
-  free.clear();
-  for(int i = 0; i < size; i++)
-    free.push_front(start+i);
+  // Однопоточно: сбрасываем локальный кэш, перестраиваем глобальный пул
+  tl_sec_cache.clear();
+  free_global.clear();
+  free_global.reserve(size);
+  for(int i = 0; i < size; i++) free_global.push_back(&start[i]);
 }
 
 };
@@ -135,6 +160,24 @@ public:
 ivec2 dim;                                //Size
 secpool pool;                             //Data Pool
 
+// Thread safety: atomic_flag spinlock (~3-5нс) вместо recursive_mutex (~50нс).
+// add() / remove() разбиты на locked wrapper + add_internal() / remove_internal()
+// чтобы избежать рекурсивного захвата (add_internal рекурсирует без лока).
+static const int CELL_LOCK_STRIPES = 4096;
+mutable std::atomic_flag cell_flags[CELL_LOCK_STRIPES]; // C++20: default = false
+
+static int cell_stripe(ivec2 pos) {
+    uint64_t h = (uint64_t)(uint32_t)pos.x * 2654435761ULL
+               ^ (uint64_t)(uint32_t)pos.y * 1234567891ULL;
+    return (int)(h % CELL_LOCK_STRIPES);
+}
+void acquire_cell(int s) const {
+    while(cell_flags[s].test_and_set(std::memory_order_acquire));
+}
+void release_cell(int s) const {
+    cell_flags[s].clear(std::memory_order_release);
+}
+
 //Queries
 double height(ivec2);                     //Query Height at Discrete Position
 double height(vec2);                      //Query Height at Position (Bilinear Interpolation)
@@ -145,8 +188,10 @@ vec3 normal(vec2, Vertexpool<Vertex>&);   //Normal Vector at Position (Read from
 SurfType surface(ivec2);                  //Surface Type at Position
 
 //Modifiers
-void add(ivec2, sec*);                    //Add Layer at Position
-double remove(ivec2, double);             //Remove Layer at Position
+void add(ivec2, sec*);                    //Add Layer at Position (acquires cell spinlock)
+void add_internal(ivec2, sec*);           //Add Layer — no lock, called recursively
+double remove(ivec2, double);             //Remove Layer at Position (acquires cell spinlock)
+double remove_internal(ivec2, double);    //Remove Layer — no lock
 sec* top(ivec2 pos){                      //Top Element at Position
   return dat[pos.x*dim.y+pos.y];
 }
@@ -227,7 +272,16 @@ Layermap(int SEED, ivec2 _dim, Vertexpool<Vertex>& vertexpool):Layermap(SEED, _d
 
 };
 
+// Locked wrapper — захватывает spinlock ячейки, затем вызывает add_internal
 void Layermap::add(ivec2 pos, sec* E){
+  int s = cell_stripe(pos);
+  acquire_cell(s);
+  add_internal(pos, E);
+  release_cell(s);
+}
+
+// Реализация без лока — рекурсивные вызовы тоже идут через add_internal
+void Layermap::add_internal(ivec2 pos, sec* E){
 
   //Non-Element: Don't Add
   if(E == NULL)
@@ -257,46 +311,18 @@ void Layermap::add(ivec2 pos, sec* E){
   //Add to Water, but not equal to water
   if(dat[pos.x*dim.y+pos.y]->type == soilmap["Air"]){ //Switch with Water
 
-  //  pool.unget(E);
-
     //Remove Top Element (Water)
     sec* top = dat[pos.x*dim.y+pos.y];
     dat[pos.x*dim.y+pos.y] = top->prev;
 
-    //Add this Element
-    add(pos, E);
+    //Add this Element (без повторного захвата лока)
+    add_internal(pos, E);
 
     //Add Water Back In
-    add(pos, top);
-
+    add_internal(pos, top);
 
     return;
-
   }
-
-  /*
-  if(dat[pos.x*dim.y+pos.y]->prev != NULL)
-  if(dat[pos.x*dim.y+pos.y]->prev->size < 0.01)
-  if(dat[pos.x*dim.y+pos.y]->prev->type == E->type){    //Same Type: Make Taller, Remove E
-    dat[pos.x*dim.y+pos.y]->prev->size += E->size;
-    dat[pos.x*dim.y+pos.y]->floor += E->size;
-    pool.unget(E);
-    return;
-  }
-  */
-
-  //Try a sorting move???
-
-  /*
-  if(dat[pos.x*dim.y+pos.y]->prev != NULL)
-  if(soils[dat[pos.x*dim.y+pos.y]->type].density < soils[E->type].density)
-  if(dat[pos.x*dim.y+pos.y]->prev->type == E->type){    //Same Type: Make Taller, Remove E
-    dat[pos.x*dim.y+pos.y]->prev->size += E->size;
-    dat[pos.x*dim.y+pos.y]->floor += E->size;
-    pool.unget(E);
-    return;
-  }
-  */
 
   //Add Element
   dat[pos.x*dim.y+pos.y]->next = E;
@@ -306,8 +332,17 @@ void Layermap::add(ivec2 pos, sec* E){
 
 }
 
-//Returns Amount Removed
+// Locked wrapper
 double Layermap::remove(ivec2 pos, double h){
+  int s = cell_stripe(pos);
+  acquire_cell(s);
+  double result = remove_internal(pos, h);
+  release_cell(s);
+  return result;
+}
+
+// Реализация без лока
+double Layermap::remove_internal(ivec2 pos, double h){
 
   //No Element to Remove
   if(dat[pos.x*dim.y+pos.y] == NULL)
@@ -415,13 +450,15 @@ vec3 Layermap::normal(vec2 pos, Vertexpool<Vertex>& vertexpool){
 //Queries
 
 SurfType Layermap::surface(ivec2 pos){
-  if(dat[pos.x*dim.y+pos.y] == NULL) return 0;
-  return dat[pos.x*dim.y+pos.y]->type;
+  sec* s = dat[pos.x*dim.y+pos.y]; // single load — atomic на x86-64
+  if(s == NULL) return 0;
+  return s->type;
 }
 
 double Layermap::height(ivec2 pos){
-  if(dat[pos.x*dim.y+pos.y] == NULL) return 0.0;
-  return (dat[pos.x*dim.y+pos.y]->floor + dat[pos.x*dim.y+pos.y]->size);
+  sec* s = dat[pos.x*dim.y+pos.y]; // single load — избегаем double-read nullptr
+  if(s == NULL) return 0.0;
+  return (s->floor + s->size);
 }
 
 double Layermap::height(vec2 pos){

@@ -10,7 +10,21 @@ struct WaterParticle : public Particle {
 
   WaterParticle(Layermap& map){
 
-    pos = vec2(rand()%map.dim.x, rand()%map.dim.y);
+    // Thread-local xorshift32 RNG — безопасен при параллельном спавне частиц.
+    // Инициализация: SEED (глобальный) XOR адрес TLS-переменной (уникален на поток).
+    static thread_local unsigned tl_rseed = 0u;
+    if (!tl_rseed) {
+      tl_rseed = (unsigned)SEED ^ (unsigned)(uintptr_t)&tl_rseed;
+      if (!tl_rseed) tl_rseed = 0xACE1u;
+    }
+    auto tl_rand = [&](int n) -> int {
+      tl_rseed ^= tl_rseed << 13;
+      tl_rseed ^= tl_rseed >> 17;
+      tl_rseed ^= tl_rseed << 5;
+      return (int)((tl_rseed & 0x7FFFFFFFu) % (unsigned)n);
+    };
+
+    pos = vec2(tl_rand(map.dim.x), tl_rand(map.dim.y));
     ipos = round(pos);
     surface = map.surface(ipos);
     param = soils[surface];
@@ -194,12 +208,12 @@ struct WaterParticle : public Particle {
       double whA = 0, whB = 0;
       if(secA != NULL){
         if(secA->type == soilmap["Air"])
-        whA = secA->size;//*soils[secA->type].porosity*secA->saturation;
+        whA = secA->size;
         else whA = secA->size;
       }
       if(secB != NULL){
         if(secB->type == soilmap["Air"])
-        whB = secB->size;//*soils[secB->type].porosity*secB->saturation;
+        whB = secB->size;
         else whB = secB->size;
       }
 
@@ -238,8 +252,6 @@ struct WaterParticle : public Particle {
 
       if(transfer <= 0)
         continue;
-
-      //we are cascading an amount which is equal to our volume!
 
       bool recascade = false;
 
@@ -334,8 +346,15 @@ struct WaterParticle : public Particle {
 
   static void seep(Layermap& map, Vertexpool<Vertex>& vertexpool){
 
-    for(size_t x = 0; x < map.dim.x; x++)
-    for(size_t y = 0; y < map.dim.y; y++){
+    // cascade() использует двойную блокировку (ipos+npos в каноническом порядке)
+    // → оба вызова безопасно параллелить в одном loop.
+    // Конкуренция на stripe locks минимальна: 4096 stripe, соседние клетки
+    // редко попадают в один stripe → spinlock почти всегда свободен.
+#ifdef SM_OPENMP_ENABLED
+    #pragma omp parallel for schedule(dynamic, 8)
+#endif
+    for(int x = 0; x < (int)map.dim.x; x++)
+    for(int y = 0; y < (int)map.dim.y; y++){
       seep(ivec2(x,y), map, vertexpool);
       WaterParticle::cascade(ivec2(x,y), map, vertexpool, 3);
     }

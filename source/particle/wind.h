@@ -13,6 +13,8 @@ struct WindParticle : public Particle {
   WindParticle(Layermap& map){
 
     pos = vec2(rand()%map.dim.x, rand()%map.dim.y);
+    const vec3 pspeed = vec3(-2,0,1);
+    speed = pspeed;
 
     ipos = round(pos);
     surface = map.surface(ipos);
@@ -27,7 +29,7 @@ struct WindParticle : public Particle {
 
   //Core Properties
   const vec3 pspeed = vec3(-2,0,1);
-  vec3 speed = pspeed;
+  vec3 speed;
   double sediment = 0.0;  //Sediment Mass
   double height = 0.0;    //Particle Height
   double sheight = 0.0;   //Surface Height
