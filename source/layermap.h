@@ -227,7 +227,7 @@ void initialize(int SEED, ivec2 _dim){
 
     const float f = (float)l/(float)layers.size();
     const int Z = SEED + f*MAXSEED;
-    layers[l].init();
+    layers[l].init(SEED + (int)l);
 
     //Add a first layer!
     for(int i = 0; i < dim.x; i++){

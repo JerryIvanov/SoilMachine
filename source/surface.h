@@ -79,7 +79,8 @@ struct SurfLayer {
   float gain = 0.0f;          //
   float frequency = 1.0f;     //
 
-  void init(){
+  void init(int seed = 1337){
+    noise.SetSeed(seed);
     noise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
     noise.SetFractalType(FastNoiseLite::FractalType_FBm);
     noise.SetFractalOctaves(octaves);
